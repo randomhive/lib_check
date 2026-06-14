@@ -1,0 +1,21 @@
+# configfile for lib_check (Check_MK piggyback output to FQDN)
+# NAME:FQDN:HOST:ALT_HOSTS:CREDENTIALS:SSL_SKIP
+#
+# NAME        - short identifier (logging, temp files)
+# FQDN        - hostname shown in Check_MK (piggyback target); library DNS name
+# HOST        - primary management FQDN or IP for HTTPS REST (usually active LCC)
+# ALT_HOSTS   - optional comma-separated backup management hosts if primary LCC
+#               is unreachable (other frame LCC FQDNs); leave empty if not needed
+# CREDENTIALS - path to credentials file (USER/PASSWORD, see lib_check.credentials.example)
+# SSL_SKIP    - 1 = skip TLS certificate validation (curl -k), 0 = verify certificate
+#
+# Secure Communications must be enabled on the library for REST/HTTPS to work.
+#
+# Copy to lib_check.cfg and edit for your libraries.
+#
+#4500RZ1:ts4500.example.org:ts4500o.example.org:ts4500p.example.org,ts4500q.example.org:/etc/check_mk/credentials/4500RZ1.creds:1
+#4500RZ2:ts4500.example.org:ts4500o.example.org::/etc/check_mk/credentials/4500RZ2.creds:1
+# ------------------------------------------------------------
+# LIBRARIES
+# ------------------------------------------------------------
+#4500RZ1:ts4500.example.org:ts4500o.example.org:ts4500p.example.org:/etc/check_mk/credentials/4500RZ1.creds:1

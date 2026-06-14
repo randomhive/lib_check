@@ -1,0 +1,1512 @@
+#!/bin/sh
+
+#Description: IBM TS4500 tape library monitoring via REST API (Check_MK local checks)
+#Date       : 2026/06/08
+
+
+UNAME_OS=`uname | tr '[:upper:]' '[:lower:]'`
+case $UNAME_OS in
+  linux)
+          LOGDIR=/var/log
+          ;;
+  aix)
+          LOGDIR=/var/adm
+          ;;
+  hp-ux)
+          LOGDIR=/var/adm
+          ;;
+  darwin)
+          LOGDIR=log
+          ;;
+      *)  echo "ERROR: architecture not recognized"
+          echo
+          exit 98
+          ;;
+esac
+
+export SCRIPT_NAME=lib_check
+export LOGFILE=${LOGDIR}/${SCRIPT_NAME}.log
+export RUNDIR=`dirname "$0"`
+export TMPDIR=/tmp
+export CONFIGFILE=lib_check.cfg
+export DEBUG=${DEBUG:=0}
+export ECHO_BIN=/bin/echo
+export RUNID=$$
+export HOSTNAME=`hostname`
+
+PYTHON3=""
+for _py in python3 /usr/bin/python3; do
+  if [ -x "$_py" ] 2>/dev/null || command -v "$_py" >/dev/null 2>&1; then
+    PYTHON3="$_py"
+    break
+  fi
+done
+
+#
+#### functions
+error()
+{
+  $ECHO_BIN `date +'%Y-%m-%d %T'` "${SCRIPT_NAME}[${RUNID}] ERROR $1 $2 $3 $4 $5 $6 $7 $8 $9" >> $LOGFILE
+  $ECHO_BIN "${0} ERROR $1 $2 $3 $4 $5 $6 $7 $8 $9"
+  echo
+  usage
+}
+
+emit()
+{
+  printf '%s\n' "$1"
+}
+
+emit_cmk()
+{
+  # $1 = state, $2 = service, $3 = perfdata, $4 = text
+  emit "$1 $2 $3 $4"
+}
+
+emit_piggyback_open()
+{
+  emit "<<<<${LIB_FQDN}>>>>"
+}
+
+emit_piggyback_close()
+{
+  emit "<<<<>>>>"
+}
+
+check_service_label()
+{
+  # map internal check type to Check_MK service name (errors)
+  case "$1" in
+    library)          printf '%s' "Library" ;;
+    accessors)        printf '%s' "Accessors" ;;
+    cleaning)         printf '%s' "Cleaning" ;;
+    slots)            printf '%s' "Slots" ;;
+    drives)           printf '%s' "Drives" ;;
+    fcports_summary)      printf '%s' "FCPorts" ;;
+    events)               printf '%s' "Events" ;;
+    ethernet_ports)       printf '%s' "EthernetPorts" ;;
+    io_stations)          printf '%s' "IOstation" ;;
+    unassigned_cartridges) printf '%s' "UnassignedCartridges" ;;
+    logical_libraries)    printf '%s' "LogicalLibraries" ;;
+    node_cards)           printf '%s' "NodeCards" ;;
+    connection)           printf '%s' "Connection" ;;
+    *)                printf '%s' "$1" ;;
+  esac
+}
+
+warn()
+{
+  $ECHO_BIN `date +'%Y-%m-%d %T'` "${SCRIPT_NAME}[${RUNID}] WARN  $1 $2 $3 $4 $5 $6 $7 $8 $9" >> $LOGFILE
+  $ECHO_BIN "${0} WARN  $1 $2 $3 $4 $5 $6 $7 $8 $9" >&2
+}
+
+info()
+{
+  $ECHO_BIN `date +'%Y-%m-%d %T'` "${SCRIPT_NAME}[${RUNID}] INFO  $1 $2 $3 $4 $5 $6 $7 $8 $9" >> $LOGFILE
+  $ECHO_BIN "${0} INFO  $1 $2 $3 $4 $5 $6 $7 $8 $9" >&2
+}
+
+debug()
+{
+  if [ $DEBUG -eq 1 ]
+  then
+    $ECHO_BIN `date +'%Y-%m-%d %T'` "${SCRIPT_NAME}[${RUNID}] DEBUG $1 $2 $3 $4 $5 $6 $7 $8 $9" >> $LOGFILE
+    $ECHO_BIN "${0} DEBUG $1 $2 $3 $4 $5 $6 $7 $8 $9" >&2
+  fi
+}
+
+debug_curl()
+{
+  # print fully resolved curl command when DEBUG=1 (copy-paste ready, stderr only)
+  if [ $DEBUG -eq 1 ]
+  then
+    _cmd=""
+    for _arg in "$@"
+    do
+      if [ -z "$_cmd" ]
+      then
+        _cmd=`printf '%q' "$_arg"`
+      else
+        _cmd="${_cmd} `printf '%q' "$_arg"`"
+      fi
+    done
+    $ECHO_BIN `date +'%Y-%m-%d %T'` "${SCRIPT_NAME}[${RUNID}] DEBUG curl ${_cmd}" >> $LOGFILE
+    $ECHO_BIN "${0} DEBUG curl ${_cmd}" >&2
+  fi
+}
+
+ssl_skip_enabled()
+{
+  _val=`printf '%s' "$1" | tr -d ' \t\r\n'`
+  case "$_val" in
+    1|yes|YES|true|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+curl_lib()
+{
+  if ssl_skip_enabled "$SSL_SKIP"
+  then
+    curl -sSk "$@"
+  else
+    curl -sS "$@"
+  fi
+}
+
+debug_curl_lib()
+{
+  if ssl_skip_enabled "$SSL_SKIP"
+  then
+    debug_curl curl -sSk "$@"
+  else
+    debug_curl curl -sS "$@"
+  fi
+}
+
+usage()
+{
+  echo "usage $0"
+  echo
+  exit 99
+}
+
+parse_library_config()
+{
+  # NAME:FQDN:HOST:ALT_HOSTS:CREDENTIALS:SSL_SKIP
+  _line=`printf '%s' "$1" | tr -d '\r'`
+  LIB_NAME=""
+  LIB_FQDN=""
+  LIB_CONNECT_HOST=""
+  LIB_ALT_HOSTS=""
+  LIB_HOST=""
+  CRED_FILE=""
+  SSL_SKIP=0
+
+  IFS=:
+  set -- $_line
+  LIB_NAME=${1:-}
+  LIB_FQDN=${2:-}
+  LIB_CONNECT_HOST=${3:-}
+  LIB_ALT_HOSTS=${4:-}
+  CRED_FILE=${5:-}
+  SSL_SKIP=${6:-0}
+  SSL_SKIP=`printf '%s' "$SSL_SKIP" | tr -d ' \t'`
+  LIB_FQDN=`printf '%s' "$LIB_FQDN" | tr -d ' \t'`
+  LIB_CONNECT_HOST=`printf '%s' "$LIB_CONNECT_HOST" | tr -d ' \t'`
+  LIB_ALT_HOSTS=`printf '%s' "$LIB_ALT_HOSTS" | tr -d ' \t'`
+}
+
+resolve_cred_file()
+{
+  # relative paths are resolved against the script directory
+  _cred="$1"
+  case "$_cred" in
+    /*) printf '%s' "$_cred" ;;
+    *)  printf '%s' "${RUNDIR}/${_cred}" ;;
+  esac
+}
+
+strip_cred_value()
+{
+  _val="$1"
+  case "$_val" in
+    \"*) _val=${_val#\"}; _val=${_val%\"} ;;
+    \'*) _val=${_val#\'}; _val=${_val%\'} ;;
+  esac
+  printf '%s' "$_val"
+}
+
+load_credentials()
+{
+  # reads USER and PASSWORD from credentials file (no curl)
+  CRED_FILE=`resolve_cred_file "$1"`
+
+  if [ ! -r "$CRED_FILE" ]
+  then
+    warn credentials file "$CRED_FILE" not readable for "$LIB_NAME"
+    return 1
+  fi
+
+  _raw_user=`grep '^USER=' "$CRED_FILE" | head -1 | cut -d= -f2-`
+  _raw_password=`grep '^PASSWORD=' "$CRED_FILE" | head -1 | cut -d= -f2-`
+  LIB_USER=`strip_cred_value "$_raw_user"`
+  LIB_PASSWORD=`strip_cred_value "$_raw_password"`
+
+  if [ -z "$LIB_USER" ] || [ -z "$LIB_PASSWORD" ]
+  then
+    warn credentials file "$CRED_FILE" missing USER or PASSWORD for "$LIB_NAME"
+    return 1
+  fi
+
+  debug load_credentials file "$CRED_FILE" user "$LIB_USER"
+  return 0
+}
+
+build_login_json()
+{
+  "$PYTHON3" -c 'import json,sys; print(json.dumps({"user": sys.argv[1], "password": sys.argv[2]}))' \
+    "$LIB_USER" "$LIB_PASSWORD"
+}
+
+api_login()
+{
+  LOGIN_JSON=`build_login_json`
+  if [ -z "$LOGIN_JSON" ]
+  then
+    LOGIN_ERR="failed to build login JSON"
+    return 1
+  fi
+
+  CURL_ERR_FILE="${TMPDIR}/lib_check.${RUNID}.${LIB_NAME}.login.curlerr"
+  debug api_login host "$LIB_HOST" user "$LIB_USER"
+  debug_curl_lib \
+    -c "$COOKIE_JAR" \
+    -H 'Content-Type: application/json' \
+    -X POST "${API_BASE}/login" \
+    -d "$LOGIN_JSON"
+  HTTP_CODE=`curl_lib -o /dev/null -w '%{http_code}' \
+    -c "$COOKIE_JAR" \
+    -H 'Content-Type: application/json' \
+    -X POST "${API_BASE}/login" \
+    -d "$LOGIN_JSON" 2>"$CURL_ERR_FILE"`
+  CURL_RC=$?
+
+  if [ $CURL_RC -ne 0 ]
+  then
+    LOGIN_ERR=`head -1 "$CURL_ERR_FILE" 2>/dev/null`
+    if [ -z "$LOGIN_ERR" ]
+    then
+      LOGIN_ERR="curl exit ${CURL_RC}"
+    fi
+    rm -f "$CURL_ERR_FILE"
+    return 1
+  fi
+  rm -f "$CURL_ERR_FILE"
+
+  if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]
+  then
+    LOGIN_ERR="HTTP ${HTTP_CODE}"
+    return 1
+  fi
+  LOGIN_ERR=""
+  return 0
+}
+
+api_connect_library()
+{
+  # try primary HOST then comma-separated ALT_HOSTS (other LCC management interfaces)
+  _host_list="${LIB_CONNECT_HOST}"
+  if [ -n "$LIB_ALT_HOSTS" ]
+  then
+    _host_list="${_host_list},${LIB_ALT_HOSTS}"
+  fi
+
+  _tried=""
+  _old_ifs="$IFS"
+  IFS=,
+  for _try_host in $_host_list
+  do
+    _try_host=`printf '%s' "$_try_host" | tr -d ' \t'`
+    if [ -z "$_try_host" ]
+    then
+      continue
+    fi
+
+    LIB_HOST="$_try_host"
+    API_BASE="https://${LIB_HOST}/web/api/v1"
+    rm -f "$COOKIE_JAR"
+    debug api_connect trying "$LIB_HOST"
+
+    if api_login
+    then
+      IFS="$_old_ifs"
+      debug api_connect using "$LIB_HOST"
+      return 0
+    fi
+
+    if [ -n "$LOGIN_ERR" ]
+    then
+      _entry="${_try_host} (${LOGIN_ERR})"
+    else
+      _entry="${_try_host}"
+    fi
+    if [ -z "$_tried" ]
+    then
+      _tried="$_entry"
+    else
+      _tried="${_tried}; $_entry"
+    fi
+  done
+  IFS="$_old_ifs"
+
+  LIB_HOST=""
+  LOGIN_ERR="no reachable management host (${_tried})"
+  return 1
+}
+
+api_logout()
+{
+  debug_curl_lib \
+    -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -H 'Content-Type: application/json' \
+    -X POST "${API_BASE}/logout"
+  curl_lib \
+    -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -H 'Content-Type: application/json' \
+    -X POST "${API_BASE}/logout" >/dev/null 2>&1
+}
+
+api_get()
+{
+  # $1 = endpoint path without /v1/ prefix; sets API_JSON_FILE, API_HTTP_CODE, API_CURL_RC
+  _endpoint="$1"
+  API_JSON_FILE="${TMPDIR}/lib_check.${RUNID}.${LIB_NAME}.${_endpoint}.json"
+  _err_file="${TMPDIR}/lib_check.${RUNID}.${_endpoint}.curlerr"
+
+  debug_curl_lib \
+    -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -H 'Accept: application/json' \
+    "${API_BASE}/${_endpoint}"
+  API_HTTP_CODE=`curl_lib \
+    -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -H 'Accept: application/json' \
+    -o "$API_JSON_FILE" -w '%{http_code}' \
+    "${API_BASE}/${_endpoint}" 2>"$_err_file"`
+  API_CURL_RC=$?
+
+  _bytes=0
+  if [ -f "$API_JSON_FILE" ]
+  then
+    _bytes=`wc -c < "$API_JSON_FILE" 2>/dev/null | tr -d ' '`
+  fi
+  debug api_get endpoint "$_endpoint" http "$API_HTTP_CODE" bytes "$_bytes" rc "$API_CURL_RC"
+  if [ $DEBUG -eq 1 ] && [ -s "$API_JSON_FILE" ]
+  then
+    _preview=`head -c 120 "$API_JSON_FILE" 2>/dev/null | tr '\n' ' '`
+    debug api_get preview "$_preview"
+  fi
+}
+
+process_checks()
+{
+  # $1 = JSON response file, remaining args = check type and parameters
+  LIB_CHECK_JSON_FILE="$1"
+  export LIB_CHECK_JSON_FILE
+  shift
+  if [ -n "$LIB_CHECK_JSON_FILE_FC" ]
+  then
+    export LIB_CHECK_JSON_FILE_FC
+  fi
+  "$PYTHON3" - "$@" <<'PYEOF'
+import json
+import os
+import sys
+
+ACCESSOR_OK = {"onlineActive", "onlineStandby"}
+ACCESSOR_WARN = {
+    "scannerFailed", "gripper1Failed", "gripper2Failed",
+    "calibrating", "noMovementAllowed",
+}
+ACCESSOR_CRIT = {
+    "bothGrippersFailed", "noMotorPower", "unknown", "inServiceMode",
+}
+
+DRIVE_OK = {"online", "cleaning"}
+DRIVE_WARN = {
+    "initializing", "restarting", "resetRequired", "updating",
+    "unreachable",
+}
+DRIVE_CRIT = {"unknown", "inServiceMode"}
+
+FC_PORT_OK = {"communicationEstablished"}
+FC_PORT_CRIT = {"failed", "unreachable"}
+
+ETH_PORT_OK = {"online"}
+ETH_PORT_CRIT = {"failed", "unreachable", "offline"}
+
+NODE_CARD_OK = {"online"}
+NODE_CARD_WARN = {"restarting", "unknown"}
+NODE_CARD_CRIT = {"inServiceMode", "unreachable", "noEthernet", "noCAN"}
+
+IO_STATION_OK = {"normal", "closedNoMagazine"}
+
+IO_SLOTS_WARN = 200
+IO_SLOTS_CRIT = 244
+
+CHECK_LABELS = {
+    "library": "Library",
+    "accessors": "Accessors",
+    "cleaning": "Cleaning",
+    "slots": "Slots",
+    "drives": "Drives",
+    "fcports_summary": "FCPorts",
+    "events": "Events",
+    "ethernet_ports": "EthernetPorts",
+    "io_stations": "IOstation",
+    "unassigned_cartridges": "UnassignedCartridges",
+    "logical_libraries": "LogicalLibraries",
+    "node_cards": "NodeCards",
+}
+
+
+def cmk_line(state, service, perf="", text=""):
+    perf_part = f" {perf}" if perf else ""
+    text_part = f" {text}" if text else ""
+    print(f"{state} {service}{perf_part}{text_part}")
+
+
+def load_json_raw():
+    path = os.environ.get("LIB_CHECK_JSON_FILE", "")
+    if not path or not os.path.isfile(path):
+        raise ValueError("missing API response file")
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        raw = fh.read().strip()
+    if not raw:
+        raise ValueError("empty API response")
+    return raw
+
+
+def parse_json(raw):
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        preview = raw[:160].replace("\n", " ")
+        raise ValueError(f"invalid JSON ({exc}); response starts with: {preview!r}") from exc
+
+
+def load_json():
+    data = parse_json(load_json_raw())
+    if isinstance(data, list) and len(data) == 1:
+        return data[0]
+    return data
+
+
+def load_json_list():
+    data = parse_json(load_json_raw())
+    if isinstance(data, list):
+        return data
+    return [data]
+
+
+def load_json_list_from(path):
+    if not path or not os.path.isfile(path):
+        return []
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        raw = fh.read().strip()
+    if not raw:
+        return []
+    data = parse_json(raw)
+    if isinstance(data, list):
+        return data
+    return [data]
+
+
+def load_fc_ports_list():
+    return load_json_list_from(os.environ.get("LIB_CHECK_JSON_FILE_FC", ""))
+
+
+def short_name(location, prefix):
+    if location.startswith(prefix):
+        return location[len(prefix):]
+    return location
+
+
+def accessor_state(state):
+    if state in ACCESSOR_OK:
+        return 0
+    if state in ACCESSOR_WARN:
+        return 1
+    if state in ACCESSOR_CRIT:
+        return 2
+    return 1
+
+
+def drive_state(state):
+    if state in DRIVE_OK:
+        return 0
+    if state in DRIVE_WARN:
+        return 1
+    if state in DRIVE_CRIT:
+        return 2
+    return 1
+
+
+def fc_port_state(state):
+    if state in FC_PORT_OK:
+        return 0
+    if state in FC_PORT_CRIT or "fail" in state.lower():
+        return 2
+    return 1
+
+
+def ethernet_port_state(state):
+    if state in ETH_PORT_OK:
+        return 0
+    if state in ETH_PORT_CRIT or "fail" in state.lower():
+        return 2
+    return 1
+
+
+def node_card_state(state):
+    if state in NODE_CARD_OK:
+        return 0
+    if state in NODE_CARD_WARN:
+        return 1
+    if state in NODE_CARD_CRIT or "fail" in state.lower():
+        return 2
+    return 1
+
+
+def node_card_service_name(card):
+    card_type = card.get("type") or "unknown"
+    loc = card.get("location") or "unknown"
+    if loc.startswith("accessor_"):
+        loc_short = short_name(loc, "accessor_")
+    elif loc.startswith("frame_"):
+        loc_short = short_name(loc, "frame_")
+    else:
+        loc_short = sanitize_service_token(loc)
+    return f"NodeCard_{card_type}_{loc_short}"
+
+
+def ethernet_ipv4_enabled(value):
+    if value is None:
+        return False
+    if not isinstance(value, str):
+        return False
+    addr = value.strip()
+    if not addr or addr.lower() == "disabled" or addr == "0":
+        return False
+    return "." in addr
+
+
+def ethernet_port_is_active(port):
+    return ethernet_ipv4_enabled(port.get("ipv4Address"))
+
+
+def io_station_state(state):
+    if state in IO_STATION_OK:
+        return 0
+    if state in ("inServiceMode",) or "fail" in state.lower():
+        return 2
+    return 1
+
+
+def sanitize_service_token(value):
+    token = (value or "unknown").strip()
+    for ch in " /:\\|":
+        token = token.replace(ch, "_")
+    return token or "unknown"
+
+
+def cartridge_logical_library(cart):
+    ll = cart.get("logicalLibrary")
+    if ll is None:
+        return None
+    if isinstance(ll, str) and ll.strip().lower() in ("", "null", "none"):
+        return None
+    return str(ll).strip()
+
+
+def ports_for_drive(ports, drive_loc, drive_sn):
+    matched = []
+    seen = set()
+    for port in ports:
+        key = port.get("location")
+        if key in seen:
+            continue
+        if port.get("driveLocation") == drive_loc or (
+            drive_sn and port.get("driveSn") == drive_sn
+        ):
+            matched.append(port)
+            if key:
+                seen.add(key)
+    return matched
+
+
+FC_PORT_FIELD_ORDER = (
+    "location",
+    "portNumber",
+    "state",
+    "wwpn",
+    "speedSetting",
+    "speedActual",
+    "topologySetting",
+    "topologyActual",
+    "loopID",
+    "nPortID",
+    "vendor",
+    "sn",
+    "pn",
+    "manufactureDate",
+)
+
+
+def resource_fields(entry, field_order):
+    fields = []
+    for key in field_order:
+        if key not in entry:
+            continue
+        value = entry[key]
+        if value is None:
+            continue
+        fields.append(f"{key}={value}")
+    return fields
+
+
+def fc_port_fields(port):
+    return resource_fields(port, FC_PORT_FIELD_ORDER)
+
+
+def format_fc_ports(ports):
+    parts = []
+    for port in ports:
+        fields = fc_port_fields(port)
+        if fields:
+            parts.append(", ".join(fields))
+    return " | ".join(parts)
+
+
+DRIVE_FIELD_ORDER = (
+    "sn",
+    "mediaType",
+    "state",
+    "operation",
+    "accessible",
+    "mtm",
+    "barcode",
+    "interface",
+    "interfaceMode",
+    "logicalLibrary",
+    "use",
+    "firmware",
+    "encryption",
+    "wwnn",
+    "elementAddress",
+    "beacon",
+    "volser",
+    "lastCleaned",
+)
+
+
+def drive_fields(drv):
+    return resource_fields(drv, DRIVE_FIELD_ORDER)
+
+
+def check_library(name):
+    lib = load_json()
+    status = lib.get("status", "unknown")
+    licensed = int(lib.get("licensedCapacity") or 0)
+    assigned = int(lib.get("assignedCartridges") or 0)
+    total_cap = int(lib.get("totalCapacity") or 0)
+    total_cart = int(lib.get("totalCartridges") or 0)
+    cleaning = int(lib.get("cleaningCartridges") or 0)
+    data_cart = int(lib.get("dataCartridges") or 0)
+    firmware = lib.get("firmware", "?")
+    lib_name = lib.get("name", name)
+    cart_access = lib.get("cartridgeAccess", "unknown")
+
+    util = 0.0
+    if licensed > 0:
+        util = round(assigned * 100.0 / licensed, 1)
+
+    state = 0
+    if status != "online":
+        state = 2
+    elif cart_access not in ("normal", None):
+        state = max(state, 1)
+    if licensed > 0 and util >= 98:
+        state = max(state, 2)
+    elif licensed > 0 and util >= 90:
+        state = max(state, 1)
+
+    perf = (
+        f"licensed_capacity={licensed}|assigned_cartridges={assigned}"
+        f"|total_capacity={total_cap}|total_cartridges={total_cart}"
+        f"|cleaning_cartridges={cleaning}|data_cartridges={data_cart}"
+        f"|capacity_util={util};90;98;0;100"
+    )
+    text = (
+        f"Library {lib_name}: status={status}, firmware={firmware}, "
+        f"cartridgeAccess={cart_access}, utilization={util}%"
+    )
+    cmk_line(state, "Library", perf, text)
+
+
+ACCESSOR_FIELD_ORDER = (
+    "state",
+    "stateReferenceEvent",
+    "driveAccess",
+    "cartridgeAccess",
+    "pivots",
+    "barCodeScans",
+    "velocityScalingXY",
+    "velocityScalingPivot",
+    "travelX",
+    "travelY",
+    "getsGripper1",
+    "putsGripper1",
+    "getsGripper2",
+    "putsGripper2",
+    "temperature",
+    "humidity",
+)
+
+
+def accessor_fields(acc):
+    fields = []
+    for key in ACCESSOR_FIELD_ORDER:
+        if key not in acc:
+            continue
+        value = acc[key]
+        if value is None:
+            continue
+        fields.append(f"{key}={value}")
+    return fields
+
+
+def check_accessors(name):
+    accessors = load_json_list()
+    if not accessors:
+        cmk_line(2, "Accessors", "-", "No accessors reported")
+        return
+
+    for acc in accessors:
+        loc = acc.get("location") or "unknown"
+
+        state = 0
+        if "state" in acc:
+            state = accessor_state(acc["state"])
+        if acc.get("driveAccess") not in (None, "normal"):
+            state = max(state, 1)
+        if acc.get("cartridgeAccess") not in (None, "normal"):
+            state = max(state, 1)
+
+        svc = f"Accessor_{short_name(loc, 'accessor_')}"
+        cmk_line(state, svc, "-", ", ".join(accessor_fields(acc)))
+
+
+CLEANING_REMAINING_WARN = 100
+CLEANING_REMAINING_CRIT = 50
+
+
+def check_cleaning(name):
+    cartridges = load_json_list()
+    count = len(cartridges)
+    total_remaining = 0
+    bad_state = 0
+
+    for cc in cartridges:
+        total_remaining += int(cc.get("cleansRemaining") or 0)
+        if cc.get("state", "unknown") != "normal":
+            bad_state += 1
+
+    state = 0
+    if count == 0:
+        state = 2
+    elif total_remaining <= CLEANING_REMAINING_CRIT:
+        state = 2
+    elif total_remaining <= CLEANING_REMAINING_WARN or bad_state > 0:
+        state = 1
+
+    perf = (
+        f"cleaning_count={count}|cleans_remaining_total={total_remaining}"
+        f";{CLEANING_REMAINING_WARN};{CLEANING_REMAINING_CRIT};0"
+    )
+    text = (
+        f"Cleaning cartridges: count={count}, total remaining cleans={total_remaining}, "
+        f"bad_state={bad_state}"
+    )
+    cmk_line(state, "Cleaning", perf, text)
+
+
+def tier_has_cartridge(value):
+    if value is None:
+        return False
+    if isinstance(value, str) and not value.strip():
+        return False
+    return True
+
+
+def slot_cartridge_count(slot):
+    from_contents = 0
+    contents = slot.get("contents")
+    if isinstance(contents, list):
+        from_contents = sum(1 for item in contents if tier_has_cartridge(item))
+    from_field = 0
+    try:
+        from_field = int(slot.get("cartridges") or 0)
+    except (TypeError, ValueError):
+        pass
+    return max(from_contents, from_field)
+
+
+def slot_tier_count(slot):
+    from_field = 0
+    try:
+        from_field = int(slot.get("tiers") or 0)
+    except (TypeError, ValueError):
+        pass
+    contents = slot.get("contents")
+    from_contents = len(contents) if isinstance(contents, list) else 0
+    return max(from_field, from_contents)
+
+
+def check_slots(name):
+    slots = load_json_list()
+    physical_slots = len(slots)
+    tier_capacity = 0
+    cartridges = 0
+    physical_occupied = 0
+    in_service = 0
+
+    state = 0
+    for slot in slots:
+        slot_state = slot.get("state", "unknown")
+        slot_carts = slot_cartridge_count(slot)
+        tiers = slot_tier_count(slot)
+        tier_capacity += tiers
+        cartridges += slot_carts
+
+        if slot_state == "inServiceMode":
+            in_service += 1
+            state = max(state, 1)
+        elif slot_state != "normal":
+            state = max(state, 1)
+
+        if slot_carts > 0:
+            physical_occupied += 1
+
+    tier_empty = tier_capacity - cartridges
+    util = 0.0
+    if tier_capacity > 0:
+        util = round(cartridges * 100.0 / tier_capacity, 1)
+
+    perf = (
+        f"slots_total={tier_capacity}|slots_occupied={cartridges}"
+        f"|slots_empty={tier_empty}|slots_physical={physical_slots}"
+        f"|slots_physical_occupied={physical_occupied}"
+        f"|slots_in_service={in_service};0;1|cartridges_in_slots={cartridges}"
+        f"|slot_util={util};85;95;0;100"
+    )
+    text = (
+        f"Slots: cartridges={cartridges}, tier_capacity={tier_capacity}, "
+        f"empty_tiers={tier_empty}, physical_slots={physical_slots}, "
+        f"physical_occupied={physical_occupied}, in_service={in_service}, "
+        f"utilization={util}%"
+    )
+    cmk_line(state, "Slots", perf, text)
+
+
+def check_drives(name):
+    drives = load_json_list()
+    fc_ports = load_fc_ports_list()
+    if not drives:
+        cmk_line(2, "Drives", "-", "No drives reported")
+        return
+
+    for drv in drives:
+        loc = drv.get("location") or "unknown"
+        matched_ports = ports_for_drive(fc_ports, loc, drv.get("sn"))
+
+        state = 0
+        if "state" in drv:
+            state = drive_state(drv["state"])
+        if drv.get("accessible") not in (None, "normal"):
+            state = max(state, 1)
+        for port in matched_ports:
+            if "state" in port:
+                state = max(state, fc_port_state(port["state"]))
+
+        text_parts = drive_fields(drv)
+        fc_text = format_fc_ports(matched_ports)
+        if fc_text:
+            text_parts.append(fc_text)
+
+        svc = f"Drive_{short_name(loc, 'drive_')}"
+        cmk_line(state, svc, "-", ", ".join(text_parts))
+
+
+def check_fc_ports_summary(name):
+    ports = load_json_list()
+    if not ports:
+        cmk_line(0, "FCPorts", "fc_port_count=0", "No FC ports reported")
+        return
+
+    summary_state = 0
+    port_count = len(ports)
+    bad_ports = 0
+
+    for port in ports:
+        state = fc_port_state(port.get("state", "unknown"))
+        summary_state = max(summary_state, state)
+        if state > 0:
+            bad_ports += 1
+
+    cmk_line(
+        summary_state,
+        "FCPorts",
+        f"fc_port_count={port_count}|fc_port_bad={bad_ports}",
+        f"FC ports: total={port_count}, bad={bad_ports}",
+    )
+
+
+def check_events(name):
+    events = load_json_list()
+    warnings = []
+    errors = []
+
+    for ev in events:
+        severity = ev.get("severity", "")
+        if severity == "warning":
+            warnings.append(ev)
+        elif severity == "error":
+            errors.append(ev)
+
+    warn_count = len(warnings)
+    err_count = len(errors)
+    state = 0
+    if err_count > 0:
+        state = 2
+    elif warn_count > 0:
+        state = 1
+
+    perf = f"events_warning={warn_count}|events_error={err_count}"
+    details = []
+    for ev in errors[:5]:
+        details.append(
+            f"#{ev.get('ID')} [error] {ev.get('type', '?')}: "
+            f"{(ev.get('description') or '')[:100]}"
+        )
+    for ev in warnings[:5]:
+        details.append(
+            f"#{ev.get('ID')} [warning] {ev.get('type', '?')}: "
+            f"{(ev.get('description') or '')[:100]}"
+        )
+    text = (
+        f"Active (not silenced) events: {err_count} error(s), {warn_count} warning(s)"
+    )
+    if details:
+        text = f"{text} | " + " | ".join(details)
+    cmk_line(state, "Events", perf, text)
+
+
+def check_ethernet_ports(name):
+    ports = load_json_list()
+    active_ports = [port for port in ports if ethernet_port_is_active(port)]
+    if not active_ports:
+        cmk_line(0, "EthernetPorts", "ethernet_port_count=0", "No active Ethernet ports")
+        return
+
+    summary_state = 0
+    port_count = len(active_ports)
+    bad_ports = 0
+
+    for port in active_ports:
+        loc = port.get("location", "unknown")
+        state_name = port.get("state")
+        if state_name:
+            state = ethernet_port_state(state_name)
+        else:
+            state = 0
+
+        summary_state = max(summary_state, state)
+        if state > 0:
+            bad_ports += 1
+
+        mac = port.get("macAddress") or "-"
+        ipv4 = port.get("ipv4Address") or "-"
+        assignment = port.get("ipv4Assignment") or "?"
+        gateway = port.get("ipv4Gateway") or "-"
+        svc = f"EthernetPort_{short_name(loc, 'ethernetPort_')}"
+        text = (
+            f"mac={mac}, ipv4={ipv4}, ipv4Subnet={port.get('ipv4Subnet') or '-'}, "
+            f"ipv4Gateway={gateway}, ipv4Assignment={assignment}"
+        )
+        if state_name:
+            text = f"state={state_name}, {text}"
+        cmk_line(state, svc, "-", text)
+
+    cmk_line(
+        summary_state,
+        "EthernetPorts",
+        f"ethernet_port_count={port_count}|ethernet_port_bad={bad_ports}",
+        f"Ethernet ports: active={port_count}, bad={bad_ports}",
+    )
+
+
+def check_node_cards(name):
+    cards = load_json_list()
+    if not cards:
+        cmk_line(2, "NodeCards", "-", "No node cards reported")
+        return
+
+    summary_state = 0
+    card_count = len(cards)
+    bad_cards = 0
+
+    for card in cards:
+        state_name = card.get("state", "unknown")
+        state = node_card_state(state_name)
+        summary_state = max(summary_state, state)
+        if state > 0:
+            bad_cards += 1
+
+        card_type = card.get("type") or "?"
+        loc = card.get("location") or "unknown"
+        card_id = card.get("ID", "?")
+        firmware = card.get("firmware") or "?"
+        part_num = card.get("partNum") or "?"
+        sn = card.get("sn") or "?"
+
+        svc = node_card_service_name(card)
+        text = (
+            f"type={card_type}, location={loc}, state={state_name}, "
+            f"id={card_id}, firmware={firmware}, partNum={part_num}, sn={sn}"
+        )
+
+        if card_type == "LCC":
+            reporting = card.get("reportingLCC")
+            primary = card.get("primaryLCC")
+            last_restart = card.get("lastRestart")
+            cf_vendor = card.get("cfVendor")
+            if reporting is not None:
+                text = f"{text}, reportingLCC={reporting}"
+            if primary is not None:
+                text = f"{text}, primaryLCC={primary}"
+            if last_restart:
+                text = f"{text}, lastRestart={last_restart}"
+            if cf_vendor:
+                text = f"{text}, cfVendor={cf_vendor}"
+
+        cmk_line(state, svc, "-", text)
+
+    cmk_line(
+        summary_state,
+        "NodeCards",
+        f"node_card_count={card_count}|node_card_bad={bad_cards}",
+        f"Node cards: total={card_count}, bad={bad_cards}",
+    )
+
+
+def magazine_occupied_slots(magazine):
+    if not isinstance(magazine, dict) or "contentsVolser" not in magazine:
+        return 0
+    volsers = magazine.get("contentsVolser") or []
+    return sum(1 for volser in volsers if volser is not None)
+
+
+def io_station_fields(station):
+    fields = []
+
+    if "state" in station:
+        fields.append(f"state={station['state']}")
+
+    door = station.get("door")
+    if isinstance(door, dict):
+        if "opened" in door:
+            fields.append(f"door_opened={door['opened']}")
+        if "lastChanged" in door:
+            fields.append(f"door_lastChanged={door['lastChanged']}")
+
+    magazine = station.get("magazine")
+    if isinstance(magazine, dict):
+        if "mediaType" in magazine:
+            fields.append(f"mediaType={magazine['mediaType']}")
+        if "ioSlots" in magazine:
+            fields.append(f"ioSlots={magazine['ioSlots']}")
+        if "contentsVolser" in magazine:
+            occupied = magazine_occupied_slots(magazine)
+            fields.append(f"occupied={occupied}")
+
+    return fields
+
+
+def check_io_stations(name):
+    stations = load_json_list()
+    if not stations:
+        cmk_line(0, "IOstation", "IOslots=0", "No I/O stations reported")
+        return
+
+    total_occupied = 0
+    summary_state = 0
+
+    for station in stations:
+        loc = station.get("location") or "unknown"
+        fields = io_station_fields(station)
+
+        state = 0
+        if "state" in station:
+            state = io_station_state(station["state"])
+
+        door = station.get("door")
+        if isinstance(door, dict) and door.get("opened") == "yes":
+            state = max(state, 1)
+
+        magazine = station.get("magazine")
+        if isinstance(magazine, dict):
+            total_occupied += magazine_occupied_slots(magazine)
+
+        summary_state = max(summary_state, state)
+        svc = f"IOStation_{short_name(loc, 'ioStation_')}"
+        cmk_line(state, svc, "-", ", ".join(fields))
+
+    fill_state = 0
+    if total_occupied >= IO_SLOTS_CRIT:
+        fill_state = 2
+    elif total_occupied >= IO_SLOTS_WARN:
+        fill_state = 1
+
+    fill_state = max(fill_state, summary_state)
+    perf = f"IOslots={total_occupied};{IO_SLOTS_WARN};{IO_SLOTS_CRIT};0"
+    cmk_line(
+        fill_state,
+        "IOstation",
+        perf,
+        f"I/O station occupied slots={total_occupied}",
+    )
+
+
+def check_unassigned_cartridges(name):
+    cartridges = load_json_list()
+    unassigned = []
+    bad_state = 0
+
+    for cart in cartridges:
+        if cartridge_logical_library(cart) is not None:
+            continue
+        unassigned.append(cart)
+        if cart.get("state", "unknown") != "normal":
+            bad_state += 1
+
+    count = len(unassigned)
+    state = 0
+    if count > 0:
+        state = 1
+    if bad_state > 0:
+        state = max(state, 2)
+
+    sample_volsers = []
+    for cart in unassigned[:10]:
+        volser = cart.get("volser") or cart.get("internalAddress") or "?"
+        sample_volsers.append(str(volser))
+
+    perf = f"unassigned_cartridges={count}|unassigned_bad_state={bad_state}"
+    text = f"Unassigned data cartridges: count={count}, bad_state={bad_state}"
+    if sample_volsers:
+        text = f"{text}, examples={', '.join(sample_volsers)}"
+    cmk_line(state, "UnassignedCartridges", perf, text)
+
+
+def check_logical_libraries(name):
+    libraries = load_json_list()
+    if not libraries:
+        cmk_line(0, "LogicalLibraries", "-", "No logical libraries reported")
+        return
+
+    for entry in libraries:
+        ll_name = entry.get("name") or "unknown"
+        cartridges = entry.get("cartridges")
+        drives = entry.get("drives")
+        virtual_slots = entry.get("virtualSlots")
+        virtual_io_slots = entry.get("virtualIOSlots")
+        media = entry.get("mediaType")
+        safeguarded = entry.get("safeguardedProtection")
+        encryption = entry.get("encryptionMethod")
+
+        state = 0
+        util = 0.0
+        if (
+            virtual_slots is not None
+            and cartridges is not None
+            and int(virtual_slots) > 0
+        ):
+            util = round(int(cartridges) * 100.0 / int(virtual_slots), 1)
+            if util >= 98:
+                state = 2
+            elif util >= 90:
+                state = 1
+
+        perf_parts = []
+        if cartridges is not None:
+            perf_parts.append(f"cartridges={cartridges}")
+        if virtual_slots is not None:
+            perf_parts.append(f"virtual_slots={virtual_slots}")
+        if drives is not None:
+            perf_parts.append(f"drives={drives}")
+        if virtual_slots and cartridges is not None and int(virtual_slots) > 0:
+            perf_parts.append(f"slot_util={util};90;98;0;100")
+        perf = "|".join(perf_parts) if perf_parts else "-"
+
+        fields = []
+        if cartridges is not None:
+            fields.append(f"cartridges={cartridges}")
+        if virtual_slots is not None:
+            fields.append(f"virtualSlots={virtual_slots}")
+        if virtual_io_slots is not None:
+            fields.append(f"virtualIOSlots={virtual_io_slots}")
+        if drives is not None:
+            fields.append(f"drives={drives}")
+        if media is not None:
+            fields.append(f"mediaType={media}")
+        if safeguarded is not None:
+            fields.append(f"safeguardedProtection={safeguarded}")
+        if encryption is not None:
+            fields.append(f"encryptionMethod={encryption}")
+        if virtual_slots and cartridges is not None and int(virtual_slots) > 0:
+            fields.append(f"utilization={util}%")
+
+        svc = f"LogicalLib_{sanitize_service_token(ll_name)}"
+        text = f"Logical library {ll_name}: " + ", ".join(fields)
+        cmk_line(state, svc, perf, text)
+
+
+def main():
+    check = sys.argv[1]
+    name = sys.argv[2]
+
+    if check == "library":
+        check_library(name)
+    elif check == "accessors":
+        check_accessors(name)
+    elif check == "cleaning":
+        check_cleaning(name)
+    elif check == "slots":
+        check_slots(name)
+    elif check == "drives":
+        check_drives(name)
+    elif check == "fcports_summary":
+        check_fc_ports_summary(name)
+    elif check == "events":
+        check_events(name)
+    elif check == "ethernet_ports":
+        check_ethernet_ports(name)
+    elif check == "io_stations":
+        check_io_stations(name)
+    elif check == "unassigned_cartridges":
+        check_unassigned_cartridges(name)
+    elif check == "logical_libraries":
+        check_logical_libraries(name)
+    elif check == "node_cards":
+        check_node_cards(name)
+    else:
+        raise ValueError(f"unknown check type: {check}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        check = sys.argv[1] if len(sys.argv) > 1 else "unknown"
+        label = CHECK_LABELS.get(check, check)
+        cmk_line(2, label, "-", f"Check failed: {exc}")
+        sys.exit(1)
+PYEOF
+}
+
+response_preview()
+{
+  if [ -f "$1" ]
+  then
+    head -c 160 "$1" 2>/dev/null | tr '\n' ' '
+  fi
+}
+
+run_check()
+{
+  # $1 = endpoint, $2 = check type, remaining args passed to python
+  ENDPOINT="$1"
+  CHECK_TYPE="$2"
+  shift 2
+
+  debug run_check endpoint "$ENDPOINT" type "$CHECK_TYPE"
+  api_get "$ENDPOINT"
+
+  _svc_label=`check_service_label "$CHECK_TYPE"`
+
+  if [ "$API_CURL_RC" -ne 0 ]
+  then
+    emit_cmk "2" "$_svc_label" "-" \
+      "curl failed for ${ENDPOINT} (exit ${API_CURL_RC})"
+    rm -f "$API_JSON_FILE"
+    return 1
+  fi
+
+  if [ "$API_HTTP_CODE" != "200" ]
+  then
+    _preview=`response_preview "$API_JSON_FILE"`
+    emit_cmk "2" "$_svc_label" "-" \
+      "HTTP ${API_HTTP_CODE} from ${ENDPOINT}: ${_preview}"
+    rm -f "$API_JSON_FILE"
+    return 1
+  fi
+
+  if [ ! -s "$API_JSON_FILE" ]
+  then
+    emit_cmk "2" "$_svc_label" "-" "Empty response from ${ENDPOINT}"
+    rm -f "$API_JSON_FILE"
+    return 1
+  fi
+
+  process_checks "$API_JSON_FILE" "$CHECK_TYPE" "$LIB_NAME" "$@"
+  rm -f "$API_JSON_FILE"
+}
+
+run_check_drives()
+{
+  # fetch drives and FC ports; FC data is merged into per-drive checks
+  DRIVES_FILE=""
+  FC_FILE=""
+
+  debug run_check_drives
+  api_get "drives"
+  if [ "$API_CURL_RC" -ne 0 ] || [ "$API_HTTP_CODE" != "200" ] || [ ! -s "$API_JSON_FILE" ]
+  then
+    _preview=`response_preview "$API_JSON_FILE"`
+    if [ "$API_CURL_RC" -ne 0 ]
+    then
+      emit_cmk "2" "Drives" "-" "curl failed for drives (exit ${API_CURL_RC})"
+    elif [ "$API_HTTP_CODE" != "200" ]
+    then
+      emit_cmk "2" "Drives" "-" "HTTP ${API_HTTP_CODE} from drives: ${_preview}"
+    else
+      emit_cmk "2" "Drives" "-" "Empty response from drives"
+    fi
+    rm -f "$API_JSON_FILE"
+    return 1
+  fi
+  DRIVES_FILE="$API_JSON_FILE"
+
+  api_get "fcPorts"
+  if [ "$API_CURL_RC" -eq 0 ] && [ "$API_HTTP_CODE" = "200" ] && [ -s "$API_JSON_FILE" ]
+  then
+    FC_FILE="$API_JSON_FILE"
+    LIB_CHECK_JSON_FILE_FC="$FC_FILE" process_checks "$DRIVES_FILE" drives "$LIB_NAME"
+  else
+    debug run_check_drives fcPorts unavailable using drives only
+    LIB_CHECK_JSON_FILE_FC="" process_checks "$DRIVES_FILE" drives "$LIB_NAME"
+  fi
+  rm -f "$DRIVES_FILE" "$FC_FILE"
+  LIB_CHECK_JSON_FILE_FC=""
+}
+
+run_check_cartridges()
+{
+  debug run_check_cartridges
+  api_get "dataCartridges"
+  if [ "$API_CURL_RC" -ne 0 ] || [ "$API_HTTP_CODE" != "200" ] || [ ! -s "$API_JSON_FILE" ]
+  then
+    _preview=`response_preview "$API_JSON_FILE"`
+    if [ "$API_CURL_RC" -ne 0 ]
+    then
+      emit_cmk "2" "UnassignedCartridges" "-" \
+        "curl failed for dataCartridges (exit ${API_CURL_RC})"
+    elif [ "$API_HTTP_CODE" != "200" ]
+    then
+      emit_cmk "2" "UnassignedCartridges" "-" \
+        "HTTP ${API_HTTP_CODE} from dataCartridges: ${_preview}"
+    else
+      emit_cmk "2" "UnassignedCartridges" "-" "Empty response from dataCartridges"
+    fi
+    rm -f "$API_JSON_FILE"
+    return 1
+  fi
+
+  process_checks "$API_JSON_FILE" unassigned_cartridges "$LIB_NAME"
+  rm -f "$API_JSON_FILE"
+}
+
+process_library()
+{
+  debug process_library "$LIB_NAME" fqdn "$LIB_FQDN" connect "$LIB_CONNECT_HOST"
+
+  COOKIE_JAR="${TMPDIR}/lib_check.${RUNID}.${LIB_NAME}.cookies"
+  API_BASE=""
+  LIB_HOST=""
+
+  if ! load_credentials "$CRED_FILE"
+  then
+    emit_piggyback_open
+    _cred_path=`resolve_cred_file "$CRED_FILE"`
+    emit_cmk "2" "Connection" "-" "Credentials file not readable: ${_cred_path}"
+    emit_piggyback_close
+    return 1
+  fi
+
+  emit_piggyback_open
+
+  if ! api_connect_library
+  then
+    if [ -n "$LOGIN_ERR" ]
+    then
+      _login_msg="REST login failed (${LOGIN_ERR})"
+    else
+      _login_msg="REST login failed for ${LIB_CONNECT_HOST}"
+    fi
+    emit_cmk "2" "Connection" "-" "$_login_msg"
+    emit_piggyback_close
+    rm -f "$COOKIE_JAR"
+    return 1
+  fi
+
+  run_check library library || true
+  run_check accessors accessors || true
+  run_check cleaningCartridges cleaning || true
+  run_check slots slots || true
+  run_check_drives || true
+  run_check fcPorts fcports_summary || true
+  run_check events events || true
+  run_check ethernetPorts ethernet_ports || true
+  run_check nodeCards node_cards || true
+  run_check ioStations io_stations || true
+  run_check_cartridges || true
+  run_check logicalLibraries logical_libraries || true
+
+  emit_piggyback_close
+
+  api_logout
+  rm -f "$COOKIE_JAR"
+}
+
+
+if [ -z "$PYTHON3" ]
+then
+  error python3 not found
+  exit 98
+fi
+
+if [ ! -r "$CONFIGFILE" ]
+then
+  error CONFIGFILE "$CONFIGFILE" not readable
+  exit 98
+fi
+
+LINECOUNT=`grep -v '^#' "$CONFIGFILE" | grep -c ':' || true`
+debug "configured libraries in $CONFIGFILE: $LINECOUNT"
+
+if [ "$LINECOUNT" -ge 1 ]
+then
+  grep -v '^#' "$CONFIGFILE" | while IFS= read _cfg_line
+  do
+    case "$_cfg_line" in
+      ""|*#*) continue ;;
+    esac
+
+    parse_library_config "$_cfg_line"
+
+    if [ -z "$LIB_NAME" ]
+    then
+      continue
+    fi
+
+    debug "LIB_NAME       : $LIB_NAME"
+    debug "LIB_FQDN       : $LIB_FQDN"
+    debug "LIB_CONNECT    : $LIB_CONNECT_HOST"
+    debug "LIB_ALT_HOSTS  : $LIB_ALT_HOSTS"
+    debug "CRED_FILE      : $CRED_FILE"
+    debug "SSL_SKIP       : $SSL_SKIP"
+
+    process_library
+  done
+fi

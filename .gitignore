@@ -1,0 +1,10 @@
+.DS_Store
+# Local config (copy from lib_check.cfg.example)
+lib_check.cfg
+!lib_check.cfg.example
+# REST API credentials (copy from lib_check.credentials.example)
+lib_check.credentials
+*.credentials
+!*.credentials.example
+cookies.txt
+log/lib_check.log
